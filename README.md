@@ -54,3 +54,7 @@ gradle installDebug
 ## 当前分支说明
 
 当前 `main` 分支已经是最新版本。旧的实验分支已清理，当前仓库以这一版为主线继续开发。
+
+## 开源协议
+
+本项目基于 `MIT License` 开源，详见仓库根目录下的 [LICENSE](./LICENSE) 文件。
