@@ -12,6 +12,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,6 +34,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -60,7 +62,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -70,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.text.DecimalFormat
 import java.text.SimpleDateFormat
@@ -96,6 +98,8 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
     val query by vm.query.collectAsStateWithLifecycle()
     val sortOrder by vm.sortOrder.collectAsStateWithLifecycle()
     val revision by vm.revision.collectAsStateWithLifecycle()
+    val favoritePaths by vm.favoritePaths.collectAsStateWithLifecycle()
+    val libraryFilter by vm.libraryFilter.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val progressStore = remember { PlaybackProgressStore(context) }
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -166,14 +170,14 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
                     val summary = loaded?.summary
                     if (summary != null) {
                         Column {
-                            Text("Telegram Cache Player", fontSize = 16.sp)
+                            Text("Telegram Player", fontSize = 16.sp)
                             Text(
                                 "${summary.totalCount} videos  ·  ${formatSize(summary.totalBytes)}",
                                 fontSize = 11.sp,
                             )
                         }
                     } else {
-                        Text("Telegram Cache Player")
+                        Text("Telegram Player")
                     }
                 },
                 actions = {
@@ -249,6 +253,30 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
             }
             Spacer(Modifier.height(6.dp))
             HorizontalDivider()
+            Spacer(Modifier.height(8.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                FilterChip(
+                    selected = libraryFilter == LibraryFilter.ALL,
+                    onClick = { vm.setLibraryFilter(LibraryFilter.ALL) },
+                    label = { Text(LibraryFilter.ALL.label, fontSize = 12.sp) },
+                )
+                FilterChip(
+                    selected = libraryFilter == LibraryFilter.FAVORITES,
+                    onClick = { vm.setLibraryFilter(LibraryFilter.FAVORITES) },
+                    label = { Text(LibraryFilter.FAVORITES.label, fontSize = 12.sp) },
+                )
+                if (favoritePaths.isNotEmpty()) {
+                    Text(
+                        text = "${favoritePaths.size} saved",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
 
             when (val s = state) {
                 VideoListState.Idle -> {
@@ -271,7 +299,13 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
                 is VideoListState.Loaded -> {
                     if (s.videos.isEmpty()) {
                         Spacer(Modifier.height(16.dp))
-                        if (query.isNotBlank()) {
+                        if (libraryFilter == LibraryFilter.FAVORITES) {
+                            Text(
+                                "No saved videos yet.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else if (query.isNotBlank()) {
                             Text(
                                 "No videos match \"$query\".",
                                 fontSize = 12.sp,
@@ -298,9 +332,11 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
                             videos = s.videos,
                             groupByDate = sortOrder == SortOrder.MODIFIED_DESC ||
                                 sortOrder == SortOrder.MODIFIED_ASC,
+                            favoritePaths = favoritePaths,
                             progressStore = progressStore,
                             revision = revision,
                             onPlay = { idx -> play(s.videos, idx) },
+                            onToggleFavorite = { v -> vm.toggleFavorite(v) },
                             onLongPress = { v -> pendingDelete = v },
                         )
                     }
@@ -342,9 +378,11 @@ private fun AppScreen(vm: VideoListViewModel = viewModel()) {
 private fun VideoList(
     videos: List<TelegramFileScanner.Video>,
     groupByDate: Boolean,
+    favoritePaths: Set<String>,
     progressStore: PlaybackProgressStore,
     revision: Int,
     onPlay: (index: Int) -> Unit,
+    onToggleFavorite: (TelegramFileScanner.Video) -> Unit,
     onLongPress: (TelegramFileScanner.Video) -> Unit,
 ) {
     // Precompute section labels when grouping by date.
@@ -385,9 +423,11 @@ private fun VideoList(
             item(key = v.file.path) {
                 VideoRow(
                     video = v,
+                    isFavorite = v.file.path in favoritePaths,
                     progressStore = progressStore,
                     revision = revision,
                     onClick = { onPlay(index) },
+                    onToggleFavorite = { onToggleFavorite(v) },
                     onLongPress = { onLongPress(v) },
                 )
             }
@@ -399,9 +439,11 @@ private fun VideoList(
 @Composable
 private fun VideoRow(
     video: TelegramFileScanner.Video,
+    isFavorite: Boolean,
     progressStore: PlaybackProgressStore,
     revision: Int,
     onClick: () -> Unit,
+    onToggleFavorite: () -> Unit,
     onLongPress: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
@@ -463,6 +505,19 @@ private fun VideoRow(
                         .padding(horizontal = 4.dp, vertical = 1.dp),
                 )
             }
+            if (isFavorite) {
+                Text(
+                    text = "SAVED",
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Black,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(5.dp)
+                        .background(Color(0xFFFFD54F), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                )
+            }
             if (watchedFraction > 0f) {
                 LinearProgressIndicator(
                     progress = { watchedFraction },
@@ -501,6 +556,38 @@ private fun VideoRow(
                 }
             }
         }
+        Spacer(Modifier.width(8.dp))
+        FavoriteToggle(
+            isFavorite = isFavorite,
+            onToggleFavorite = onToggleFavorite,
+        )
+    }
+}
+
+@Composable
+private fun FavoriteToggle(
+    isFavorite: Boolean,
+    onToggleFavorite: () -> Unit,
+) {
+    val background = if (isFavorite) Color(0xFFFFD54F)
+    else MaterialTheme.colorScheme.surfaceVariant
+    val contentColor = if (isFavorite) Color.Black
+    else MaterialTheme.colorScheme.onSurfaceVariant
+
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(background)
+            .clickable(onClick = onToggleFavorite)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = if (isFavorite) "Saved" else "Save",
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            color = contentColor,
+        )
     }
 }
 

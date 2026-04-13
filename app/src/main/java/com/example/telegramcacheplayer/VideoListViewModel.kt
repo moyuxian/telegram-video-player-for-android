@@ -28,6 +28,16 @@ enum class SortOrder {
         }
 }
 
+enum class LibraryFilter {
+    ALL, FAVORITES;
+
+    val label: String
+        get() = when (this) {
+            ALL -> "All"
+            FAVORITES -> "Favorites"
+        }
+}
+
 sealed interface RawScanState {
     data object Idle : RawScanState
     data object Scanning : RawScanState
@@ -53,9 +63,17 @@ sealed interface VideoListState {
     data class Error(val message: String) : VideoListState
 }
 
+private data class ListControls(
+    val query: String,
+    val sortOrder: SortOrder,
+    val favoritePaths: Set<String>,
+    val libraryFilter: LibraryFilter,
+)
+
 class VideoListViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("video_list_prefs", android.content.Context.MODE_PRIVATE)
+    private val favoritesStore = FavoritesStore(app)
 
     private val _raw = MutableStateFlow<RawScanState>(RawScanState.Idle)
     private val _refreshing = MutableStateFlow(false)
@@ -66,6 +84,12 @@ class VideoListViewModel(app: Application) : AndroidViewModel(app) {
     private val _sortOrder = MutableStateFlow(loadSortOrder())
     val sortOrder: StateFlow<SortOrder> = _sortOrder.asStateFlow()
 
+    private val _favoritePaths = MutableStateFlow(favoritesStore.allFavorites())
+    val favoritePaths: StateFlow<Set<String>> = _favoritePaths.asStateFlow()
+
+    private val _libraryFilter = MutableStateFlow(LibraryFilter.ALL)
+    val libraryFilter: StateFlow<LibraryFilter> = _libraryFilter.asStateFlow()
+
     private fun loadSortOrder(): SortOrder {
         val name = prefs.getString("sort_order", null) ?: return SortOrder.MODIFIED_DESC
         return runCatching { SortOrder.valueOf(name) }.getOrDefault(SortOrder.MODIFIED_DESC)
@@ -75,38 +99,16 @@ class VideoListViewModel(app: Application) : AndroidViewModel(app) {
     private val _revision = MutableStateFlow(0)
     val revision: StateFlow<Int> = _revision.asStateFlow()
 
+    private val listControls = combine(
+        _query, _sortOrder, _favoritePaths, _libraryFilter,
+    ) { query, sortOrder, favoritePaths, libraryFilter ->
+        ListControls(query, sortOrder, favoritePaths, libraryFilter)
+    }
+
     val state: StateFlow<VideoListState> = combine(
-        _raw, _refreshing, _query, _sortOrder,
-    ) { raw, refreshing, q, sort ->
-        when (raw) {
-            RawScanState.Idle -> VideoListState.Idle
-            RawScanState.Scanning -> VideoListState.Scanning
-            is RawScanState.Error -> VideoListState.Error(raw.message)
-            is RawScanState.Loaded -> {
-                val filtered = if (q.isBlank()) raw.videos else {
-                    val needle = q.trim().lowercase()
-                    raw.videos.filter {
-                        it.name.lowercase().contains(needle) ||
-                            it.relativePath.lowercase().contains(needle)
-                    }
-                }
-                val sorted = when (sort) {
-                    SortOrder.MODIFIED_DESC -> filtered.sortedByDescending { it.lastModified }
-                    SortOrder.MODIFIED_ASC -> filtered.sortedBy { it.lastModified }
-                    SortOrder.NAME_ASC -> filtered.sortedBy { it.name.lowercase() }
-                    SortOrder.NAME_DESC -> filtered.sortedByDescending { it.name.lowercase() }
-                    SortOrder.SIZE_DESC -> filtered.sortedByDescending { it.sizeBytes }
-                    SortOrder.SIZE_ASC -> filtered.sortedBy { it.sizeBytes }
-                }
-                val summary = ScanSummary(
-                    totalCount = raw.videos.size,
-                    totalBytes = raw.videos.sumOf { it.sizeBytes },
-                    newest = raw.videos.maxOfOrNull { it.lastModified } ?: 0L,
-                    oldest = raw.videos.minOfOrNull { it.lastModified } ?: 0L,
-                )
-                VideoListState.Loaded(sorted, summary, refreshing)
-            }
-        }
+        _raw, _refreshing, listControls,
+    ) { raw, refreshing, controls ->
+        buildState(raw, refreshing, controls)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, VideoListState.Idle)
 
     /** Notify rows that persisted progress may have changed (e.g. after playback). */
@@ -138,9 +140,15 @@ class VideoListViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setQuery(q: String) { _query.value = q }
+    fun setLibraryFilter(filter: LibraryFilter) { _libraryFilter.value = filter }
     fun setSortOrder(order: SortOrder) {
         _sortOrder.value = order
         prefs.edit().putString("sort_order", order.name).apply()
+    }
+
+    fun toggleFavorite(video: TelegramFileScanner.Video) {
+        favoritesStore.toggle(video.file.path)
+        _favoritePaths.value = favoritesStore.allFavorites()
     }
 
     /** Deletes a file from disk and removes it from the in-memory list. */
@@ -150,12 +158,56 @@ class VideoListViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { video.file.delete() }.getOrDefault(false)
             }
             if (deleted) {
+                favoritesStore.remove(video.file.path)
+                _favoritePaths.value = favoritesStore.allFavorites()
                 val current = _raw.value
                 if (current is RawScanState.Loaded) {
                     _raw.value = RawScanState.Loaded(
                         current.videos.filter { it.file.path != video.file.path }
                     )
                 }
+            }
+        }
+    }
+
+    private fun buildState(
+        raw: RawScanState,
+        refreshing: Boolean,
+        controls: ListControls,
+    ): VideoListState {
+        return when (raw) {
+            RawScanState.Idle -> VideoListState.Idle
+            RawScanState.Scanning -> VideoListState.Scanning
+            is RawScanState.Error -> VideoListState.Error(raw.message)
+            is RawScanState.Loaded -> {
+                val scoped = when (controls.libraryFilter) {
+                    LibraryFilter.ALL -> raw.videos
+                    LibraryFilter.FAVORITES -> raw.videos.filter {
+                        it.file.path in controls.favoritePaths
+                    }
+                }
+                val filtered = if (controls.query.isBlank()) scoped else {
+                    val needle = controls.query.trim().lowercase()
+                    scoped.filter {
+                        it.name.lowercase().contains(needle) ||
+                            it.relativePath.lowercase().contains(needle)
+                    }
+                }
+                val sorted = when (controls.sortOrder) {
+                    SortOrder.MODIFIED_DESC -> filtered.sortedByDescending { it.lastModified }
+                    SortOrder.MODIFIED_ASC -> filtered.sortedBy { it.lastModified }
+                    SortOrder.NAME_ASC -> filtered.sortedBy { it.name.lowercase() }
+                    SortOrder.NAME_DESC -> filtered.sortedByDescending { it.name.lowercase() }
+                    SortOrder.SIZE_DESC -> filtered.sortedByDescending { it.sizeBytes }
+                    SortOrder.SIZE_ASC -> filtered.sortedBy { it.sizeBytes }
+                }
+                val summary = ScanSummary(
+                    totalCount = scoped.size,
+                    totalBytes = scoped.sumOf { it.sizeBytes },
+                    newest = scoped.maxOfOrNull { it.lastModified } ?: 0L,
+                    oldest = scoped.minOfOrNull { it.lastModified } ?: 0L,
+                )
+                VideoListState.Loaded(sorted, summary, refreshing)
             }
         }
     }
